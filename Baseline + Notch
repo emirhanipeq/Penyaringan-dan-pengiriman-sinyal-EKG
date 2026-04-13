@@ -1,0 +1,315 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+"""
+=============================================================
+  ECG-ID DATABASE — EKG SİNYAL ANALİZİ
+  Veri Seti: ecg-id-database-1.0.0 (PhysioNet)
+
+  İçerik:
+    1. WFDB Formatında Veri Okuma (.dat / .hea)
+    2. Baseline Correction  (High-pass Butterworth filtre)
+    3. R Dalgası Tespiti    (scipy.signal.find_peaks)
+    4. FFT Analizi          (np.fft.rfft)
+    5. Tüm Grafikler
+    6. Özet İstatistikler
+
+  Kullanım:
+    - DATA_DIR değişkenini kendi zip/klasör yoluna göre ayarla
+    - PERSON ve RECORD değişkenleriyle hangi kaydı inceleyeceğini seç
+=============================================================
+"""
+
+import os
+import struct
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+from scipy.signal import butter, filtfilt, find_peaks, iirnotch
+
+# ─────────────────────────────────────────────────────────
+# ⚙️  AYARLAR — Buradan değiştirebilirsin
+# ─────────────────────────────────────────────────────────
+# Bu satırların kodun üst kısımlarında mutlaka olması lazım:
+DATA_DIR = "/kaggle/input/datasets/emirhanpekk/veriseti/ecg-id-database-1.0.0/ecg-id-database-1.0.0"
+PERSON   = "Person_07"
+RECORD   = "rec_1"
+# ─────────────────────────────────────────────────────────
+# 1. WFDB OKUYUCU (wfdb kütüphanesi olmadan .dat/.hea okur)
+# ─────────────────────────────────────────────────────────
+def read_wfdb(data_dir, person, record):
+    """
+    .hea başlığını ayrıştırır, .dat dosyasını okur.
+    Dönüş:
+        signals : (n_samples, n_channels) numpy array — mV cinsinden
+        fs      : Örnekleme frekansı (Hz)
+        info    : Sözlük (yaş, cinsiyet, tarih)
+        ch_names: Kanal isimleri listesi
+    """
+    base   = os.path.join(data_dir, person, record)
+    hea_path = base + ".hea"
+    dat_path = base + ".dat"
+
+    # Başlık satırlarını oku
+    with open(hea_path, "r") as f:
+        lines = f.readlines()
+
+    # İlk satır: kayıt adı, kanal sayısı, fs, örnek sayısı
+    header  = lines[0].split()
+    n_ch    = int(header[1])
+    fs      = int(header[2])
+    n_samp  = int(header[3])
+
+    # Sinyal satırları
+    gains, baselines, ch_names = [], [], []
+    for i in range(1, 1 + n_ch):
+        parts = lines[i].split()
+        gains.append(float(parts[2]))       # ADC gain (LSB/mV)
+        baselines.append(float(parts[4]))   # ADC baseline
+        ch_names.append(" ".join(parts[8:]) if len(parts) > 8 else f"CH{i}")
+
+    # Yorum satırlarından meta veri
+    info = {}
+    for line in lines:
+        if line.startswith("# Age"):
+            info["Yaş"]     = line.split(":")[1].strip()
+        elif line.startswith("# Sex"):
+            info["Cinsiyet"]= line.split(":")[1].strip()
+        elif line.startswith("# ECG date"):
+            info["Tarih"]   = line.split(":")[1].strip()
+
+    # İkili veri: format 16 → signed int16, kanallar aralarında sıralı
+    raw = np.fromfile(dat_path, dtype=np.int16)
+    raw = raw.reshape(-1, n_ch)            # (n_samples, n_channels)
+
+    # mV'a dönüştür
+    signals = np.zeros_like(raw, dtype=float)
+    for c in range(n_ch):
+        signals[:, c] = (raw[:, c] - baselines[c]) / gains[c]
+
+    return signals, fs, info, ch_names
+
+
+# ─────────────────────────────────────────────────────────
+# 2. BASELINE CORRECTION
+# ─────────────────────────────────────────────────────────
+def baseline_correction(signal, fs, cutoff=0.5, order=4):
+    """
+    Yüksek geçirgen Butterworth filtresi.
+    cutoff=0.5 Hz → solunum/hareket kaynaklı drift giderilir.
+    filtfilt → sıfır faz kayması (ileri + geri filtreleme).
+    """
+    nyq = fs / 2
+    b, a = butter(order, cutoff / nyq, btype='high', analog=False)
+    return filtfilt(b, a, signal)
+
+def apply_notch_filter(signal, fs, freq=50.0, quality_factor=30.0):
+    """50 Hz şebeke gürültüsünü keser."""
+    nyq = fs / 2
+    freq_norm = freq / nyq
+    b, a = iirnotch(freq_norm, quality_factor)
+    return filtfilt(b, a, signal)
+
+# ─────────────────────────────────────────────────────────
+# 3. FFT ANALİZİ
+# ─────────────────────────────────────────────────────────
+def compute_fft(signal, fs):
+    """
+    Tek taraflı normalize genlik spektrumu.
+    Dönüş: freqs (Hz), magnitude
+    """
+    N   = len(signal)
+    fft = np.fft.rfft(signal)
+    mag = np.abs(fft) * 2 / N
+    frq = np.fft.rfftfreq(N, d=1/fs)
+    return frq, mag
+
+
+# ─────────────────────────────────────────────────────────
+# 4. VERİYİ OKU
+# ─────────────────────────────────────────────────────────
+print(f"Kayıt okunuyor: {PERSON}/{RECORD}")
+signals, fs, info, ch_names = read_wfdb(DATA_DIR, PERSON, RECORD)
+
+print(f"  Örnekleme Frekansı : {fs} Hz")
+print(f"  Kanal Sayısı       : {signals.shape[1]}")
+print(f"  Toplam Örnek       : {signals.shape[0]} ({signals.shape[0]/fs:.1f} sn)")
+for k, v in info.items():
+    print(f"  {k:<12}: {v}")
+
+# Ham EKG — Kanal 0 (ECG I — ham)
+raw_ecg = signals[:, 0]
+
+# ─────────────────────────────────────────────────────────
+# 5. BASELINE CORRECTION UYGULA
+# ─────────────────────────────────────────────────────────
+# 5. FİLTRELEME ZİNCİRİ
+corrected_base = baseline_correction(raw_ecg, fs, cutoff=0.5) # Önce kaymayı sil
+corrected_ecg  = apply_notch_filter(corrected_base, fs)      # Sonra 50Hz gürültüsünü sil
+
+# ─────────────────────────────────────────────────────────
+# 6. R DALGASI TESPİTİ
+# ─────────────────────────────────────────────────────────
+# Yükseklik eşiği: corrected sinyalin maksimumunun %50'si
+threshold = 0.5 * np.max(corrected_ecg)
+r_raw, _  = find_peaks(raw_ecg,       height=threshold, distance=fs//3)
+r_cor, _  = find_peaks(corrected_ecg, height=threshold, distance=fs//3)
+
+# ─────────────────────────────────────────────────────────
+# 7. FFT
+# ─────────────────────────────────────────────────────────
+freqs_raw, mag_raw = compute_fft(raw_ecg,       fs)
+freqs_cor, mag_cor = compute_fft(corrected_ecg, fs)
+
+# ─────────────────────────────────────────────────────────
+# 8. GRAFİKLER
+# ─────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(16, 22))
+fig.suptitle(
+    f"ECG-ID Database — {PERSON} / {RECORD}\n"
+    f"Yaş: {info.get('Yaş','?')}  |  "
+    f"Cinsiyet: {info.get('Cinsiyet','?')}  |  "
+    f"Tarih: {info.get('Tarih','?')}  |  "
+    f"fs={fs} Hz",
+    fontsize=13, fontweight='bold', y=0.99
+)
+
+gs = gridspec.GridSpec(5, 1, figure=fig, hspace=0.45)
+t  = np.arange(len(raw_ecg)) / fs   # Zaman ekseni (saniye)
+
+# ── Plot 1: Ham EKG (tüm kayıt) ──────────────────────────
+ax1 = fig.add_subplot(gs[0])
+ax1.plot(t, raw_ecg, color='steelblue', lw=0.7, label='Ham EKG (Kanal 0)')
+ax1.plot(r_raw/fs, raw_ecg[r_raw], 'rx', ms=8, mew=2, label=f'R Dalgası (n={len(r_raw)})')
+ax1.set_title("Ham EKG — Tüm Kayıt + R Dalgası Tespiti", fontsize=11)
+ax1.set_xlabel("Zaman (s)")
+ax1.set_ylabel("Genlik (mV)")
+ax1.legend(fontsize=8)
+ax1.grid(True, alpha=0.3)
+
+# ── Plot 2: Baseline Corrected EKG ───────────────────────
+ax2 = fig.add_subplot(gs[1])
+ax2.plot(t, corrected_ecg, color='darkorange', lw=0.7, label='Baseline Corrected EKG')
+ax2.plot(r_cor/fs, corrected_ecg[r_cor], 'rx', ms=8, mew=2, label=f'R Dalgası (n={len(r_cor)})')
+ax2.axhline(0, color='gray', ls='--', lw=0.6, label='Sıfır çizgisi')
+ax2.set_title("Baseline Correction Sonrası EKG (High-pass, 0.5 Hz)", fontsize=11)
+ax2.set_xlabel("Zaman (s)")
+ax2.set_ylabel("Genlik (mV)")
+ax2.legend(fontsize=8)
+ax2.grid(True, alpha=0.3)
+
+# ── Plot 3: Ham vs Corrected karşılaştırma (ilk 3 sn) ────
+n3s = int(3 * fs)
+ax3 = fig.add_subplot(gs[2])
+ax3.plot(t[:n3s], raw_ecg[:n3s],       color='steelblue',  lw=1.0, alpha=0.8, label='Ham EKG')
+ax3.plot(t[:n3s], corrected_ecg[:n3s], color='darkorange', lw=1.0, alpha=0.8, label='Corrected EKG')
+ax3.set_title("Ham vs Baseline Corrected EKG — İlk 3 Saniye", fontsize=11)
+ax3.set_xlabel("Zaman (s)")
+ax3.set_ylabel("Genlik (mV)")
+ax3.legend(fontsize=8)
+ax3.grid(True, alpha=0.3)
+
+# ── Plot 4: FFT — Ham EKG ────────────────────────────────
+ax4 = fig.add_subplot(gs[3])
+ax4.plot(freqs_raw, mag_raw, color='steelblue', lw=0.8)
+ax4.axvspan(0,    0.5,  alpha=0.18, color='red',    label='Baseline Wander (<0.5 Hz)')
+ax4.axvspan(0.5,  2.5,  alpha=0.18, color='green',  label='P & T Dalgaları (0.5–2.5 Hz)')
+ax4.axvspan(5,    40,   alpha=0.18, color='orange', label='QRS Kompleksi (5–40 Hz)')
+ax4.axvspan(40,   100,  alpha=0.12, color='gray',   label='Yüksek frekans / Gürültü (>40 Hz)')
+ax4.set_title("FFT — Ham EKG Frekans Spektrumu", fontsize=11)
+ax4.set_xlabel("Frekans (Hz)")
+ax4.set_ylabel("Genlik")
+ax4.set_xlim(0, 100)
+ax4.legend(fontsize=7, loc='upper right')
+ax4.grid(True, alpha=0.3)
+
+# ── Plot 5: FFT — Corrected EKG ─────────────────────────
+ax5 = fig.add_subplot(gs[4])
+ax5.plot(freqs_cor, mag_cor, color='darkorange', lw=0.8)
+ax5.axvspan(0,    0.5,  alpha=0.18, color='red',    label='Baseline Wander temizlendi')
+ax5.axvspan(0.5,  2.5,  alpha=0.18, color='green',  label='P & T Dalgaları (0.5–2.5 Hz)')
+ax5.axvspan(5,    40,   alpha=0.18, color='orange', label='QRS Kompleksi (5–40 Hz)')
+ax5.axvspan(40,   100,  alpha=0.12, color='gray',   label='Yüksek frekans / Gürültü (>40 Hz)')
+ax5.set_title("FFT — Baseline Correction Sonrası EKG Frekans Spektrumu", fontsize=11)
+ax5.set_xlabel("Frekans (Hz)")
+ax5.set_ylabel("Genlik")
+ax5.set_xlim(0, 100)
+ax5.legend(fontsize=7, loc='upper right')
+ax5.grid(True, alpha=0.3)
+
+plt.savefig("/kaggle/working/ekg_id_analiz.png", dpi=150, bbox_inches='tight')
+plt.show()
+print("Grafik kaydedildi.")
+
+# ─────────────────────────────────────────────────────────
+# 9. ÖZET İSTATİSTİKLER
+# ─────────────────────────────────────────────────────────
+print("\n" + "="*55)
+print("  ÖZET İSTATİSTİKLER")
+print("="*55)
+print(f"  Kayıt          : {PERSON} / {RECORD}")
+for k, v in info.items():
+    print(f"  {k:<12}   : {v}")
+print(f"  Süre           : {len(raw_ecg)/fs:.1f} saniye")
+print(f"  Örnekleme      : {fs} Hz")
+print(f"  R Dalgası (ham): {len(r_raw)}")
+print(f"  R Dalgası (cor): {len(r_cor)}")
+
+if len(r_cor) > 1:
+    rr_ms = np.diff(r_cor) / fs * 1000
+    bpm   = 60 / (np.mean(rr_ms) / 1000)
+    print(f"  Ort. RR Aralığı: {np.mean(rr_ms):.1f} ms")
+    print(f"  Kalp Hızı      : {bpm:.1f} BPM")
+    print(f"  RR Std         : {np.std(rr_ms):.1f} ms  (HRV göstergesi)")
+
+dom_freq = freqs_cor[np.argmax(mag_cor[1:])+1]  # DC bileşeni atla
+print(f"  FFT Baskın Frek: {dom_freq:.2f} Hz")
+print("="*55)
+
+# ─────────────────────────────────────────────────────────
+# 10. BAŞKA KAYITLARI ANALİZ ETMEK İÇİN DÖNGÜ
+# ─────────────────────────────────────────────────────────
+# Aşağıdaki bloğu etkinleştirirsen Person_01'in tüm kayıtlarını analiz eder:
+ANALYZE_ALL = True
+if ANALYZE_ALL:
+    rec_dir = os.path.join(DATA_DIR, PERSON)
+    records = sorted(set(f.replace('.dat','') for f in os.listdir(rec_dir) if f.endswith('.dat')))
+    for rec in records:
+        sigs, fs_, info_, chs = read_wfdb(DATA_DIR, PERSON, rec)
+        ecg = sigs[:, 0]
+        cor = baseline_correction(ecg, fs_)
+        r, _ = find_peaks(cor, height=0.5*np.max(cor), distance=fs_//3)
+        if len(r) > 1:
+            bpm = 60 / (np.mean(np.diff(r)) / fs_)
+            print(f"{rec}: {len(r)} R dalgası, {bpm:.1f} BPM")
+
+#rec_1.hea  → Başlık dosyası (metadata)
+#             - Örnekleme frekansı (500 Hz)
+ #            - Kanal sayısı
+ #            - Yaş, cinsiyet, tarih
+  #           - Gain/baseline değerleri
+
+#rec_1.dat  → Asıl sinyal verisi ← EKG sinyali buradan okunuyor!
+ #            - Ham sayısal değerler (binary format)
+  #           - mV'a dönüştürülerek işleniyor
+
+#rec_1.atr  → Annotation dosyası (şu an kullanılmıyor)
+  #           - Uzman tarafından işaretlenmiş R dalgası noktaları
+      #       - Karşılaştırma/doğrulama için kullanılabilir
+        
