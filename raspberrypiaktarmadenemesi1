@@ -123,3 +123,10 @@ if __name__ == "__main__":
         print("\nSimülasyon kullanıcı tarafından durduruldu.")
     finally:
         led.off() # Program çökse bile LED'i güvenli şekilde kapat
+
+
+// raspi kurlulumu 
+//pip install numpy scipy gpiozero (kütüphaneleri ekle)
+//veri setini rasp a çek 
+//Donanım bağlantısnı yap 
+//python rpi_ekg.py ( rasp üzreinden kodu çalıştır).
