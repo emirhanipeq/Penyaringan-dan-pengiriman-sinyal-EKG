@@ -1,0 +1,114 @@
+import os
+import time
+import numpy as np
+from scipy.signal import butter, filtfilt, find_peaks, iirnotch
+from gpiozero import LED
+
+# ─────────────────────────────────────────────────────────
+# ⚙️   (Raspberry Pi'ye Göre Ayar)
+# ─────────────────────────────────────────────────────────
+ 
+# Örnek: "/home/emirhan/Desktop/ecg-id-database-1.0.0"
+DATA_DIR = "/home/kullanici_adi/Masaustu/ecg-id-database-1.0.0" 
+PERSON   = "Person_07"
+RECORD   = "rec_1"
+
+LED_PIN  = 17 # LED GPIO Pini
+
+# ─────────────────────────────────────────────────────────
+# 1. FONKSİYONLAR (temizleme algoritmalarım)
+# ─────────────────────────────────────────────────────────
+def read_wfdb(data_dir, person, record):
+    base = os.path.join(data_dir, person, record)
+    hea_path = base + ".hea"
+    dat_path = base + ".dat"
+
+    with open(hea_path, "r") as f:
+        lines = f.readlines()
+
+    header = lines[0].split()
+    n_ch = int(header[1])
+    fs = int(header[2])
+    n_samp = int(header[3])
+
+    gains, baselines = [], []
+    for i in range(1, 1 + n_ch):
+        parts = lines[i].split()
+        gains.append(float(parts[2]))
+        baselines.append(float(parts[4]))
+
+    raw = np.fromfile(dat_path, dtype=np.int16)
+    raw = raw.reshape(-1, n_ch)
+
+    signals = np.zeros_like(raw, dtype=float)
+    for c in range(n_ch):
+        signals[:, c] = (raw[:, c] - baselines[c]) / gains[c]
+
+    return signals, fs
+
+def baseline_correction(signal, fs, cutoff=0.5, order=4):
+    nyq = fs / 2
+    b, a = butter(order, cutoff / nyq, btype='high', analog=False)
+    return filtfilt(b, a, signal)
+
+def apply_notch_filter(signal, fs, freq=50.0, quality_factor=30.0):
+    nyq = fs / 2
+    freq_norm = freq / nyq
+    b, a = iirnotch(freq_norm, quality_factor)
+    return filtfilt(b, a, signal)
+
+# ─────────────────────────────────────────────────────────
+# 2.similasyon çalışma bloğu 
+# ─────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print(f"Kayıt okunuyor: {PERSON}/{RECORD}")
+    
+    # Veriyi oku
+    signals, fs = read_wfdb(DATA_DIR, PERSON, RECORD)
+    raw_ecg = signals[:, 0]
+    
+    print("Veri filtreleniyor (Notch + Baseline)...")
+    corrected_base = baseline_correction(raw_ecg, fs, cutoff=0.5)
+    corrected_ecg  = apply_notch_filter(corrected_base, fs)
+    
+    print("R dalgaları (Kalp Atışları) hesaplanıyor...")
+    threshold = 0.5 * np.max(corrected_ecg)
+    r_cor, _  = find_peaks(corrected_ecg, height=threshold, distance=fs//3)
+    
+    print(f"Toplam {len(r_cor)} kalp atışı tespit edildi.")
+    print("-------------------------------------------------")
+    print("EKG LED Simülasyonu Başlıyor! (Durdurmak için CTRL+C)")
+    
+    #  DONANIM VE ZAMANLAMA AYARLARI 
+    led = LED(LED_PIN)
+    delay = 1.0 / fs          # fs=500 ise saniyede 500 döngü (0.002 sn bekleme)
+    blink_duration = 0.1      # LED'in 100 milisaniye açık kalması idealdir
+    last_blink_time = 0
+    
+    # time.perf_counter() Pi üzerinde time.time()'a göre çok daha hassastır
+    try:
+        for i in range(len(corrected_ecg)):
+            loop_start = time.perf_counter()
+            
+            # Eğer bulunduğumuz nokta bir R dalgası (kalp atışı) ise LED'i YAK
+            if i in r_cor:
+                led.on()
+                last_blink_time = time.perf_counter()
+                print("BİP! -> Kalp Atışı")
+                
+            # Eğer LED yanıyorsa ve yanma süresi dolduysa SÖNDÜR
+            if led.is_active and (time.perf_counter() - last_blink_time) > blink_duration:
+                led.off()
+                
+            # Gerçek zamanı simüle etmek için donanımı hassas şekilde beklet
+            # İşlem süresini bekleme süresinden çıkarıyoruz ki sistem gecikmesin
+            elapsed_time = time.perf_counter() - loop_start
+            if delay > elapsed_time:
+                time.sleep(delay - elapsed_time)
+                
+        print("Simülasyon tamamlandı.")
+        
+    except KeyboardInterrupt:
+        print("\nSimülasyon kullanıcı tarafından durduruldu.")
+    finally:
+        led.off() # Program çökse bile LED'i güvenli şekilde kapat
