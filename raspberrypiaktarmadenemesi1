@@ -82,10 +82,10 @@ if __name__ == "__main__":
     #  DONANIM VE ZAMANLAMA AYARLARI 
     led = LED(LED_PIN)
     delay = 1.0 / fs          # fs=500 ise saniyede 500 döngü (0.002 sn bekleme)
-    blink_duration = 0.1      # LED'in 100 milisaniye açık kalması idealdir
+    blink_duration = 0.1      # LED'in 100 milisaniye açık kalacak
     last_blink_time = 0
     
-    # time.perf_counter() Pi üzerinde time.time()'a göre çok daha hassastır
+    # time.perf_counter() Pi üzerinde time.time()'a göre çok daha hassastır o yüzden geçiş yaptım .
     try:
         for i in range(len(corrected_ecg)):
             loop_start = time.perf_counter()
@@ -95,7 +95,18 @@ if __name__ == "__main__":
                 led.on()
                 last_blink_time = time.perf_counter()
                 print("BİP! -> Kalp Atışı")
-                
+
+//r_cor_set = set(r_cor)  
+  //  try:
+        //for i in range(len(corrected_ecg)):
+          //  loop_start = time.perf_counter()
+            
+            //# Artık aramayı set içinde yapıyoruz, çok daha hızlı!
+            //if i in r_cor_set:                                                   # bu yöntem daha hızlı deniliyor deneyeceğim
+             //   led.on()
+              //  last_blink_time = time.perf_counter()
+               // print("BİP! -> Kalp Atışı")
+
             # Eğer LED yanıyorsa ve yanma süresi dolduysa SÖNDÜR
             if led.is_active and (time.perf_counter() - last_blink_time) > blink_duration:
                 led.off()
